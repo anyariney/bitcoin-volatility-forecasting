@@ -1,0 +1,537 @@
+---
+title: "Bitcoin Project"
+author: "Anya Riney-Niewiadomski"
+date: "2026-09-29"
+output: html_document
+---
+
+# 1. Settings and packages
+```{r setup, message=FALSE, warning=FALSE}
+rm(list = ls())
+set.seed(174)
+
+library(tidyverse)
+library(tsibble)
+library(fable)
+library(feasts)
+library(scales)
+library(quantmod)
+
+end_date <- "2026-10-14"
+```
+
+# 2. Reading in Bitcoin data
+```{r}
+btc_xts <- getSymbols("BTC-USD", src = "yahoo", from = "2019-01-01", to = end_date, auto.assign = FALSE)
+raw     <- tibble(date = index(btc_xts), price = as.numeric(Cl(btc_xts)))
+
+head(raw)
+tail(raw)
+summary(raw)
+```
+
+# 3. Cleaning data and building the tsibble
+Bitcoin trades every day, so any missing days get filled with the last price. Filled days create 0% returns, so it's worth knowing how many there are.
+```{r}
+btc <- raw %>%
+  filter(!is.na(price)) %>%
+  as_tsibble(index = date) %>%
+  fill_gaps()
+
+sum(is.na(btc$price))   # number of filled days
+
+btc <- btc %>% fill(price, .direction = "down")
+btc
+```
+
+# 4. Bitcoin price over time
+```{r}
+btc %>%
+  autoplot(price, color = "lightblue") +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "Daily Bitcoin Price", subtitle = "2019 - Present", x = "Year", y = "U.S. Dollars") +
+  theme_minimal()
+
+# log scale, so equal distances = equal % changes
+btc %>%
+  autoplot(log(price), color = "lightblue") +
+  labs(title = "Log of Daily Bitcoin Price", x = "Year", y = "Log Price") +
+  theme_minimal()
+```
+
+# 5. Daily log returns
+```{r}
+returns <- btc %>%
+  mutate(log_return = difference(log(price)) * 100) %>%
+  filter(!is.na(log_return))
+
+returns %>%
+  autoplot(log_return, color = "lightblue") +
+  labs(title = "Daily Bitcoin Log Returns", x = "Year", y = "Percent Change") +
+  theme_minimal()
+
+ggplot(returns, aes(x = log_return)) +
+  geom_histogram(bins = 80, fill = "lightblue", color = "white") +
+  labs(title = "Distribution of Daily Bitcoin Returns", x = "Percent Change", y = "Count") +
+  theme_minimal()
+
+# kurtosis above 3 = fat tails (population moments used throughout)
+returns %>%
+  as_tibble() %>%
+  mutate(dev = log_return - mean(log_return)) %>%
+  summarise(mean     = mean(log_return),
+            sd       = sd(log_return),
+            skewness = mean(dev^3) / mean(dev^2)^1.5,
+            kurtosis = mean(dev^4) / mean(dev^2)^2)
+```
+
+# 6. Moving averages
+```{r}
+ma <- btc %>%
+  as_tibble() %>%
+  mutate(ma30  = slider::slide_dbl(price, mean, .before = 29,  .complete = TRUE),
+         ma200 = slider::slide_dbl(price, mean, .before = 199, .complete = TRUE))
+
+ma_plot <- ma %>%
+  pivot_longer(c(price, ma30, ma200), names_to = "series", values_to = "value") %>%
+  mutate(series = gsub("ma30", "30-Day MA", series),
+         series = gsub("ma200", "200-Day MA", series),
+         series = gsub("price", "Daily Price", series),
+         series = factor(series, levels = c("Daily Price", "30-Day MA", "200-Day MA"))) %>%
+  ggplot(aes(x = date, y = value, color = series)) +
+  geom_line(na.rm = TRUE) +
+  scale_color_manual(values = c("grey70", "darkred", "lightblue")) +
+  labs(title = "30-Day and 200-Day Moving Averages of Bitcoin", x = "Year", y = "U.S. Dollars", color = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ma_plot + scale_y_continuous(labels = dollar)
+ma_plot + scale_y_log10(labels = dollar)
+
+ma %>%
+  filter(!is.na(ma200)) %>%
+  mutate(above = ma30 > ma200) %>%
+  filter(above != lag(above)) %>%
+  mutate(type = if_else(above, "Golden cross", "Death cross")) %>%
+  select(date, type, price)
+```
+
+Growth is slowing. From early 2019 to the 2021 peak, Bitcoin rose from about $3,500 to $65,000, roughly an 18x gain. From the late-2022 low of about $16,000 to the 2025 peak near $120,000, it rose about 7x. Each cycle still climbs, but the percentage gains shrink.
+
+The moving averages work as trend signals, but late. The 30-day line fell below the 200-day in early 2022 and in late 2025, both about two to three months after the peak. The early 2023 upward cross also came weeks after the low. Trailing averages confirm a trend, they don't predict the turn.
+
+During the 2023-2025 uptrend, the price pulled back to the 200-day line several times and bounced. During the 2022 downtrend, rallies stalled near it.
+
+At the right edge, the 30-day line just crossed back above the 200-day around $80,000, a new golden cross. Since the models below find little predictive power in past prices, this describes recent momentum, not a forecast.
+
+# 7. Autocorrelation
+```{r}
+btc %>%
+  ACF(log(price), lag_max = 60) %>%
+  autoplot() +
+  labs(title = "Autocorrelation of Log Bitcoin Price", x = "Lag (days)", y = "ACF") +
+  theme_minimal()
+
+returns %>%
+  ACF(log_return, lag_max = 60) %>%
+  autoplot() +
+  labs(title = "Autocorrelation of Daily Bitcoin Returns", x = "Lag (days)", y = "ACF") +
+  theme_minimal()
+
+# squared returns, big bars here = volatility clustering
+returns %>%
+  ACF(log_return^2, lag_max = 60) %>%
+  autoplot() +
+  labs(title = "Autocorrelation of Squared Bitcoin Returns", x = "Lag (days)", y = "ACF") +
+  theme_minimal()
+```
+
+Every bar in the returns ACF is small. The largest, at lag 1, is about -0.052, which explains roughly 0.3% of the next day's variation (0.052^2 = 0.0027). The log price ACF has bars near 1 for comparison.
+
+Lags 1, 4, 13, 24, 28, 33, and 40 cross the +/- 0.037 bands. With 60 lags at the 5% level, about 3 would cross by chance. However, these bands assume constant variance, and the squared-return ACF shows the variance is not constant, so the bands are too narrow and some crossings may come from volatility clustering rather than real autocorrelation.
+
+The negative lag 1 means a big up day tends to be followed by a small pullback (short-term mean reversion), common in daily crypto and stock data from bid-ask bounce and overreaction. There are no spikes at 7, 14, 21, 28, so no weekly pattern.
+
+Either way, a 0.05 correlation is too small to trade on after fees. Squared returns show large, slowly decaying bars: the direction of tomorrow's move looks unpredictable, but its size clusters. This is the reason for GARCH later.
+
+# 8. Stationarity tests (KPSS)
+Null is stationarity. feasts caps KPSS p-values between 0.01 and 0.10.
+```{r}
+btc %>% features(log(price), unitroot_kpss)
+btc %>% features(log(price), unitroot_ndiffs)
+returns %>% features(log_return, unitroot_kpss)
+```
+
+Log price: KPSS = 21.03, p ≤ 0.01, so non-stationary, and far past the 1% critical value of 0.739. ndiffs = 1, so log price is I(1). Log returns: KPSS = 0.195, p ≥ 0.10, so there is no evidence against stationarity.
+
+# 9. Train/test split
+```{r}
+cutoff <- max(btc$date) - 90
+
+train <- btc %>% filter(date <= cutoff)
+test  <- btc %>% filter(date >  cutoff)
+
+# reused in several joins and plots below
+test_prices <- test %>% as_tibble() %>% rename(actual = price)
+last_year   <- btc %>% filter(date >= cutoff - 365)
+
+nrow(train)
+nrow(test)
+```
+
+# 10. Forecasting models
+```{r}
+models <- train %>%
+  model(Mean  = MEAN(log(price)),
+        Naive = NAIVE(log(price)),
+        Drift = RW(log(price) ~ drift()),
+        ETS   = ETS(log(price)),
+        ARIMA = ARIMA(log(price))) %>%
+  mutate(Combo = (ETS + ARIMA + Naive) / 3)
+
+# check the selected orders, and that no weekly seasonal terms were picked
+models %>% select(ARIMA) %>% report()
+models %>% select(ETS) %>% report()
+
+fc <- models %>% forecast(new_data = test)
+
+fc %>%
+  filter(.model != "Mean") %>%
+  autoplot(last_year, level = NULL) +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "90-Day Forecasts of Bitcoin Price", x = "Date", y = "U.S. Dollars") +
+  theme_minimal()
+```
+
+Point forecasts from models on log(price) are back-transformed to the price scale, so RMSE and MAE compare those back-transformed forecasts. Combo averages ETS and ARIMA with Naive, and if both are close to random walks it will behave mostly like Naive.
+
+# 11. Accuracy
+Passing the full series so MASE scales by the training data.
+```{r}
+results <- fc %>%
+  accuracy(btc) %>%
+  select(.model, RMSE, MAE, MAPE, MASE) %>%
+  arrange(RMSE)
+
+results
+
+# CRPS scores the whole distribution, Winkler scores the 95% interval, lower is better
+# Combo has no full distribution so it's dropped
+results_dist <- fc %>%
+  filter(.model != "Combo") %>%
+  accuracy(btc, list(crps = CRPS, winkler = winkler_score), level = 95) %>%
+  arrange(crps)
+
+results_dist
+
+# share of actual prices inside each 95% interval
+coverage <- fc %>%
+  filter(.model != "Combo") %>%
+  hilo(level = 95) %>%
+  unpack_hilo(`95%`) %>%
+  as_tibble() %>%
+  left_join(test_prices, by = "date") %>%
+  group_by(.model) %>%
+  summarise(coverage_95 = mean(actual >= `95%_lower` & actual <= `95%_upper`))
+
+coverage
+```
+
+ARIMA (CRPS 5,504) and Drift (5,506) are almost identical, and so are ETS (6,965) and Naive (6,968). This suggests ARIMA behaves like a random walk with drift and ETS like one without, but the report() output above is what confirms it. Drift beats Naive by about 21% here, but this is only one 90-day window, so cross-validation in section 16 is the real test.
+
+Every model has 100% coverage, even Mean. That means the intervals are too wide over 90 days, not that they're good, since a 95% interval should miss about 5% of the time. CRPS is the better comparison here.
+
+# 12. Residual diagnostics for ARIMA
+```{r}
+arima     <- models %>% select(ARIMA)
+arima_res <- augment(arima) %>% filter(!is.na(.innov))
+
+arima %>% gg_tsresiduals()
+
+mean(arima_res$.innov)
+
+# Ljung-Box, null = white noise. dof only counts AR and MA terms, not the constant
+tidy(arima)$term
+arima_dof <- sum(grepl("^s?(ar|ma)[0-9]", tidy(arima)$term))
+
+arima_res %>% features(.innov, ljung_box, lag = 10, dof = arima_dof)
+
+augment(models %>% select(Naive)) %>%
+  filter(!is.na(.innov)) %>%
+  features(.innov, ljung_box, lag = 10, dof = 0)
+
+# McLeod-Li test (Ljung-Box on squared residuals), low p-value = volatility clustering is still there
+arima_res %>% features(.innov^2, ljung_box, lag = 10, dof = 0)
+```
+
+The mean residual is about zero, so ARIMA isn't biased up or down. The histogram has fat tails, and the big negative spike in early 2020 is the March 2020 COVID crash.
+
+Naive fails the Ljung-Box test (p = 0.0096), matching the small lag 1 correlation from the ACF. Like the ACF bands, Ljung-Box assumes constant variance, so with volatility clustering it rejects too often and this result should be read with that in mind.
+
+The McLeod-Li test fails badly (statistic = 52.45, p < 0.001). ARIMA models the direction of returns but assumes constant variance, so the clustering in the size of moves is left over. This is the formal reason for GARCH.
+
+# 13. Prediction intervals
+```{r}
+fc %>%
+  filter(.model == "ARIMA") %>%
+  hilo(level = c(80, 95))
+
+fc %>%
+  filter(.model == "ARIMA") %>%
+  autoplot(last_year, level = c(80, 95)) +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "ARIMA Forecast with 80% and 95% Prediction Intervals", x = "Date", y = "U.S. Dollars") +
+  theme_minimal()
+
+# bootstrap resamples past residuals instead of assuming normal errors
+models %>%
+  select(Naive) %>%
+  forecast(new_data = test, bootstrap = TRUE, times = 1000) %>%
+  autoplot(last_year, level = c(80, 95)) +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "Bootstrapped Naive Forecast of Bitcoin", x = "Date", y = "U.S. Dollars") +
+  theme_minimal()
+```
+
+# 14. GARCH(1,1) with Student-t errors
+Returns are in percent, so omega is in percent squared.
+```{r}
+ret_train <- returns %>% filter(date <= cutoff)
+
+spec <- rugarch::ugarchspec(variance.model     = list(model = "sGARCH", garchOrder = c(1, 1)),
+                            mean.model         = list(armaOrder = c(0, 0), include.mean = TRUE),
+                            distribution.model = "std")
+
+garch <- rugarch::ugarchfit(spec = spec, data = ret_train$log_return)
+garch
+
+coefs       <- rugarch::coef(garch)
+persistence <- unname(coefs["alpha1"] + coefs["beta1"])
+coefs
+persistence
+
+# half life of a volatility shock in days
+log(0.5) / log(persistence)
+
+# implied long-run daily volatility vs. the actual sample sd
+sqrt(coefs["omega"] / (1 - persistence))
+sd(ret_train$log_return)
+
+# squared standardized residuals, high p-value = GARCH removed the clustering
+std_resid <- as.numeric(rugarch::residuals(garch, standardize = TRUE))
+Box.test(std_resid^2, lag = 10, type = "Ljung-Box")
+```
+
+alpha1 = 0.075 and beta1 = 0.924, so persistence = 0.999, and a volatility shock takes about 690 days to fade by half. A value this close to 1 is close to an integrated GARCH. The implied long-run volatility, sqrt(omega / (1 - persistence)), is far above the actual sample standard deviation, which suggests the long-run estimate is unreliable. Part of the high persistence may come from regime changes in the sample (the 2021 boom vs. the 2022 crash). shape = 3.02 means very fat tails, which supports using t errors instead of normal.
+
+```{r}
+garch_fc <- rugarch::ugarchforecast(garch, n.ahead = 90)
+
+tibble(day = 1:90, sigma = as.numeric(rugarch::sigma(garch_fc))) %>%
+  ggplot(aes(day, sigma)) +
+  geom_line(color = "darkred") +
+  labs(title = "GARCH Forecast of Daily Bitcoin Volatility", x = "Days Ahead", y = "Daily Std. Dev. (%)") +
+  theme_minimal()
+
+tibble(date = ret_train$date, sigma = as.numeric(rugarch::sigma(garch))) %>%
+  ggplot(aes(date, sigma)) +
+  geom_line(color = "lightblue") +
+  labs(title = "GARCH Estimated Daily Volatility of Bitcoin", x = "Year", y = "Daily Std. Dev. (%)") +
+  theme_minimal()
+```
+
+Out-of-sample check: does the GARCH variance forecast beat a constant variance on the test period? Squared returns are a noisy proxy for true variance, and this is only one forecast origin, so it's a rough check.
+```{r}
+vol_check <- returns %>%
+  filter(date > cutoff) %>%
+  as_tibble() %>%
+  mutate(sq_ret    = log_return^2,
+         garch_var = as.numeric(rugarch::sigma(garch_fc))^2,
+         const_var = var(ret_train$log_return))
+
+vol_check %>%
+  summarise(mse_garch = mean((sq_ret - garch_var)^2),
+            mse_const = mean((sq_ret - const_var)^2))
+```
+
+# 15. GARCH price intervals with simulation
+Simulating 2,000 return paths from the last training day, turning them into prices, then taking quantiles.
+```{r}
+sims       <- rugarch::ugarchsim(garch, n.sim = 90, m.sim = 2000, startMethod = "sample")
+sim_ret    <- rugarch::fitted(sims)   # 90 x 2000, in percent
+last_price <- tail(train$price, 1)
+sim_prices <- last_price * exp(apply(sim_ret / 100, 2, cumsum))
+
+bands <- tibble(date   = test$date,
+                median = apply(sim_prices, 1, median),
+                lo95   = apply(sim_prices, 1, quantile, 0.025),
+                hi95   = apply(sim_prices, 1, quantile, 0.975),
+                lo80   = apply(sim_prices, 1, quantile, 0.10),
+                hi80   = apply(sim_prices, 1, quantile, 0.90)) %>%
+  left_join(test_prices, by = "date")
+
+ggplot(bands, aes(x = date)) +
+  geom_ribbon(aes(ymin = lo95, ymax = hi95), fill = "lightblue", alpha = 0.4) +
+  geom_ribbon(aes(ymin = lo80, ymax = hi80), fill = "lightblue", alpha = 0.7) +
+  geom_line(aes(y = median), color = "steelblue") +
+  geom_line(aes(y = actual)) +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "GARCH-t Simulated Price Intervals vs. Actual Bitcoin Price",
+       subtitle = "Shaded: 80% and 95% intervals, black line: actual price",
+       x = "Date", y = "U.S. Dollars") +
+  theme_minimal()
+
+coverage_all <- coverage %>%
+  add_row(.model = "GARCH-t", coverage_95 = mean(bands$actual >= bands$lo95 & bands$actual <= bands$hi95)) %>%
+  arrange(desc(coverage_95))
+
+coverage_all
+
+# 90-day coverage is close to 100% for everything, so the first 14 days are more informative
+bands %>%
+  slice_head(n = 14) %>%
+  summarise(coverage_95_14day = mean(actual >= lo95 & actual <= hi95),
+            coverage_80_14day = mean(actual >= lo80 & actual <= hi80))
+```
+
+# 16. Time series cross-validation
+About 3 years of starting training data, new fold every 30 days. The last folds forecast into the holdout window, so the CV and holdout results are not fully independent.
+```{r, warning=FALSE}
+cv <- btc %>%
+  filter(date >= as.Date("2021-01-01"), date <= cutoff) %>%
+  stretch_tsibble(.init = 1095, .step = 30)
+
+n_distinct(cv$.id)
+
+cv_fc <- cv %>%
+  model(Naive = NAIVE(log(price)),
+        Drift = RW(log(price) ~ drift()),
+        ARIMA = ARIMA(log(price))) %>%   # slowest step
+  forecast(h = 30)
+
+results_cv <- cv_fc %>%
+  accuracy(btc) %>%
+  select(.model, RMSE, MAE, MAPE, MASE) %>%
+  arrange(RMSE)
+
+results_cv
+
+# number each forecast by how many days ahead it is
+cv_fc_h <- cv_fc %>%
+  group_by(.id, .model) %>%
+  mutate(h = row_number()) %>%
+  ungroup() %>%
+  as_fable(response = "price", distribution = price)
+```
+
+Some folds give a "NaNs produced" warning when ARIMA picks a coefficient near a boundary. Only the standard errors are affected, not the forecasts.
+
+Across 31 folds, ARIMA (RMSE 7,510) basically ties Naive (7,500), and Drift comes last (7,770). Drift's 21% edge on the single holdout reversed across 31 windows, so the holdout likely caught a trending period.
+
+# 17. Diebold-Mariano test
+The DM test on the single holdout isn't valid because all 90 errors come from one forecast and are highly autocorrelated (h = 1 gave a p-value that was way too small, and h = 90 broke the test). Using the 1-step-ahead error from each fold instead, since those come from different starting points. With only 31 errors the test has low power, so a high p-value means no evidence of a difference, not that the models are equal.
+```{r}
+errors <- cv_fc_h %>%
+  filter(h == 1) %>%
+  as_tibble() %>%
+  left_join(btc %>% as_tibble() %>% rename(actual = price), by = "date") %>%
+  mutate(error = actual - .mean) %>%
+  select(.id, .model, error) %>%
+  pivot_wider(names_from = .model, values_from = error)
+
+forecast::dm.test(errors$ARIMA, errors$Naive, h = 1, power = 2)
+forecast::dm.test(errors$Drift, errors$Naive, h = 1, power = 2)
+```
+
+# 18. Accuracy by forecast horizon
+```{r}
+results_h <- cv_fc_h %>% accuracy(btc, by = c("h", ".model"))
+
+ggplot(results_h, aes(x = h, y = MAPE, color = .model)) +
+  geom_line() +
+  labs(title = "Forecast Error Grows with Horizon", x = "Days Ahead", y = "MAPE (%)", color = "Model") +
+  theme_minimal()
+
+results_h %>%
+  filter(h %in% c(1, 7, 30)) %>%
+  select(.model, h, RMSE, MAPE) %>%
+  arrange(h, RMSE)
+```
+
+# 19. Training window comparison
+Does the 2019-2021 data help or hurt?
+```{r}
+models_2022 <- train %>%
+  filter(date >= as.Date("2022-01-01")) %>%
+  model(ARIMA_2022 = ARIMA(log(price)),
+        Drift_2022 = RW(log(price) ~ drift()))
+
+bind_rows(fc %>% filter(.model %in% c("ARIMA", "Drift")) %>% as_tibble(),
+          models_2022 %>% forecast(new_data = test) %>% as_tibble()) %>%
+  as_fable(index = date, key = .model, response = "price", distribution = price) %>%
+  accuracy(btc) %>%
+  select(.model, RMSE, MAE, MAPE) %>%
+  arrange(RMSE)
+```
+
+# 20. ARIMA with lagged S&P 500 returns
+Weekends and holidays carry Friday's close, so the lagged S&P return is 0 on those days. This pulls the coefficient toward zero, so a weekend dummy or trading-days-only sample would be a useful robustness check.
+```{r}
+sp_xts <- getSymbols("^GSPC", src = "yahoo", from = "2019-01-01", to = end_date, auto.assign = FALSE)
+sp500  <- tibble(date = index(sp_xts), sp = as.numeric(Cl(sp_xts)))
+
+xreg <- btc %>%
+  left_join(sp500, by = "date") %>%
+  fill(sp, .direction = "down") %>%
+  mutate(lag_sp_return = lag(difference(log(sp)) * 100)) %>%
+  filter(!is.na(lag_sp_return))
+
+model_sp <- xreg %>%
+  filter(date <= cutoff) %>%
+  model(ARIMA_SP = ARIMA(log(price) ~ lag_sp_return))
+
+report(model_sp)
+tidy(model_sp)
+
+# uses the real lagged S&P values in the test period, so this is ex-post, not a true forecast
+model_sp %>%
+  forecast(new_data = xreg %>% filter(date > cutoff)) %>%
+  accuracy(xreg) %>%
+  select(.model, RMSE, MAE, MAPE)
+```
+
+If the selected model has d = 1, fable differences the regressor too, so the lag_sp_return coefficient is the change in Bitcoin's daily log return (in log units) for a 1 percentage point S&P return the day before. Multiply by 100 to read it as a percent. The p-value in tidy() shows whether it is significant.
+
+# 21. Final 30-day forecast
+```{r}
+final_fc <- btc %>%
+  model(ARIMA = ARIMA(log(price)),
+        Naive = NAIVE(log(price))) %>%
+  forecast(h = "30 days")
+
+final_fc %>%
+  filter(.model == "ARIMA") %>%
+  hilo(level = 95) %>%
+  as_tibble() %>%
+  select(date, .mean, `95%`)
+
+final_fc %>%
+  autoplot(btc %>% filter(date >= max(date) - 180), level = 95) +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "30-Day Bitcoin Price Forecast", x = "Date", y = "U.S. Dollars") +
+  theme_minimal()
+```
+
+# 22. Summary tables
+```{r}
+results        # single holdout
+results_dist   # single holdout, CRPS and Winkler
+coverage_all   # 95% coverage incl. GARCH
+results_cv     # 31 rolling folds
+```
+
+# Conclusion
+No model clearly beat the random walk. Across 31 folds, ARIMA's RMSE was within 0.2% of Naive's and Drift came last, even though Drift looked best on the single holdout. The Diebold-Mariano test in section 17 checks whether any of these differences are significant. This is consistent with weak-form market efficiency: past prices alone add little to forecasting where Bitcoin goes next.
+
+Volatility is different. The squared residuals show strong clustering in-sample, and GARCH-t finds near-unit persistence (0.999) and very fat tails (about 3 degrees of freedom). Whether that clustering also makes volatility forecastable out of sample depends on the check in section 14. The direction of Bitcoin's next move looks unpredictable, but the size of the move is not random.
+
