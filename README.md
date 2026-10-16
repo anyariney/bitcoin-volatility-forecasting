@@ -1,7 +1,5 @@
 # Forecasting Bitcoin Prices and Volatility
 
-Final project for Econ 174 (Time Series Analysis) at Santa Clara University, Fall 2026.
-
 I wanted to know two things: can past prices forecast where Bitcoin goes next, and can its volatility be predicted?
 
 ## Data
